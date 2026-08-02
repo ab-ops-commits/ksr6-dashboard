@@ -53,10 +53,22 @@ def resample_weekly(daily: pd.DataFrame) -> pd.DataFrame:
     return w.sort_values("Date").reset_index(drop=True)
 
 
-def fetch_yahoo(symbol: str) -> pd.DataFrame:
+def fetch_yahoo(symbol: str, retries: int = 2) -> pd.DataFrame:
     import yfinance as yf
-    raw = yf.Ticker(symbol).history(period=DAILY_LOOKBACK, interval="1d",
-                                    auto_adjust=False)
+    import time
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            raw = yf.Ticker(symbol).history(period=DAILY_LOOKBACK, interval="1d",
+                                            auto_adjust=False)
+            if raw is not None and not raw.empty:
+                break
+            last_err = RuntimeError(f"no data returned for {symbol}")
+        except Exception as e:
+            last_err = e
+        time.sleep(1.5 * (attempt + 1))  # backoff on retry
+    else:
+        raise last_err or RuntimeError(f"fetch failed for {symbol}")
     if raw is None or raw.empty:
         raise RuntimeError(f"no data returned for {symbol}")
     raw = raw.reset_index()
@@ -86,12 +98,14 @@ def grade_all(tickers: pd.DataFrame, get_data, idx_df: pd.DataFrame) -> list:
             r = enhanced_score_stock(name, df, idx_df, idx_df)
             if "Error" in r:
                 results.append({"name": name, "sector": row["sector"],
+                                "universe": row.get("universe","microcap250"),
                                 "error": r["Error"]})
                 continue
             pos = r.get("Position") or {}
             results.append({
                 "name": name,
                 "sector": row["sector"],
+                "universe": row.get("universe", "microcap250"),
                 "price": r["Price"],
                 "score": r["Score_Pct"],
                 "verdict": r["Verdict"],
@@ -117,6 +131,7 @@ def grade_all(tickers: pd.DataFrame, get_data, idx_df: pd.DataFrame) -> list:
             })
         except Exception as e:
             results.append({"name": name, "sector": row["sector"],
+                            "universe": row.get("universe","microcap250"),
                             "error": f"{type(e).__name__}: {e}"})
     return results
 
@@ -129,23 +144,38 @@ def render_dashboard(timer: dict, results: list, generated: str) -> str:
     ok = [r for r in results if "error" not in r]
     errs = [r for r in results if "error" in r]
     ok.sort(key=lambda r: (-r["score"], ZONE_ORDER.get(r["zone"], 9)))
-    shown = [r for r in ok if r["score"] >= SCORE_FLOOR]
-    hidden_count = len(ok) - len(shown)
 
+    # universe tag helper (short marker for queue rows)
+    def uni_tag(r):
+        return "500" if r.get("universe") == "nifty500" else "\u00b5"
+
+    # table rows shown per-universe (score floor applied), but keep counts per universe
+    def shown_for(u):
+        return [r for r in ok if r.get("universe") == u and r["score"] >= SCORE_FLOOR]
+    shown_mc = shown_for("microcap250")
+    shown_n5 = shown_for("nifty500")
+    hidden_mc = len([r for r in ok if r.get("universe")=="microcap250"]) - len(shown_mc)
+    hidden_n5 = len([r for r in ok if r.get("universe")=="nifty500"]) - len(shown_n5)
+
+    # COMBINED queues span BOTH universes, ranked together by score
     pullback_q = [r for r in ok if r["zone"] == "PULLBACK_BUY" and r["bars"] in ("BLUE", "NEUTRAL") and r["score"] >= 45]
     breakout_q = [r for r in ok if r["zone"] == "BUY_ZONE" and r["score"] >= 60]
 
     timer_up = timer["Timer"] == "UP"
     data = json.dumps({
         "timer": timer, "generated": generated,
-        "results": shown, "errors": errs, "hidden": hidden_count, "total": len(ok),
-        "pullback": [r["name"] for r in pullback_q],
-        "breakout": [r["name"] for r in breakout_q],
+        "results_mc": shown_mc, "results_n5": shown_n5,
+        "hidden_mc": hidden_mc, "hidden_n5": hidden_n5,
+        "count_mc": len([r for r in ok if r.get("universe")=="microcap250"]),
+        "count_n5": len([r for r in ok if r.get("universe")=="nifty500"]),
+        "errors": errs,
+        "pullback": [{"name": r["name"], "u": uni_tag(r), "score": r["score"]} for r in pullback_q],
+        "breakout": [{"name": r["name"], "u": uni_tag(r), "score": r["score"]} for r in breakout_q],
         "outlay_band": [OUTLAY_MIN, OUTLAY_MAX], "risk_ref": RISK_REF,
     })
 
     gate_word = "ENTRIES SANCTIONED" if timer_up else "ENTRIES LOCKED"
-    hidden_note = f"{hidden_count} below {SCORE_FLOOR}% hidden of {len(ok)} scanned"
+    hidden_note = f"{hidden_mc+hidden_n5} below {SCORE_FLOOR}% hidden"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -226,6 +256,15 @@ def render_dashboard(timer: dict, results: list, generated: str) -> str:
   .scorebar i {{ display:block; height:100%; background:var(--teal); }}
   .err {{ color:var(--red); font-size:11px; margin-top:18px; }}
   footer {{ margin-top:40px; color:var(--lock); font-size:10px; letter-spacing:1px; }}
+  .toggle {{ display:flex; gap:8px; margin:6px 0 10px; }}
+  .toggle button {{ background:var(--ink2); color:var(--dim); border:1px solid var(--line);
+                    font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:1.5px;
+                    padding:7px 14px; cursor:pointer; border-radius:2px; }}
+  .toggle button.on {{ color:var(--paper); border-color:var(--teal); background:var(--ink); }}
+  .toggle button span {{ color:var(--lock); }}
+  .utag {{ display:inline-block; min-width:22px; font-size:9px; letter-spacing:1px; color:var(--lock);
+           border:1px solid var(--line); border-radius:2px; padding:0 4px; margin-right:7px; text-align:center; }}
+  .qscore {{ color:var(--lock); font-size:11px; margin-left:6px; }}
 </style>
 </head>
 <body>
@@ -253,6 +292,10 @@ def render_dashboard(timer: dict, results: list, generated: str) -> str:
   </div>
 
   <h2>Scans ≥{SCORE_FLOOR}% · click headers to sort <span style="color:var(--lock)">· {hidden_note}</span></h2>
+  <div class="toggle">
+    <button id="tg-mc" class="on" onclick="setUniverse('mc')">MICROCAP 250 <span id="c-mc"></span></button>
+    <button id="tg-n5" onclick="setUniverse('n5')">NIFTY 500 <span id="c-n5"></span></button>
+  </div>
   <table id="tbl">
     <thead><tr>
       <th data-k="name">STOCK</th>
@@ -278,10 +321,16 @@ def render_dashboard(timer: dict, results: list, generated: str) -> str:
 const D = {data};
 const timerUp = D.timer.Timer === 'UP';
 
+function qline(x) {{
+  return `<span class="utag">${{x.u}}</span>${{x.name}}<span class="qscore">${{x.score.toFixed(1)}}%</span>`;
+}}
 document.getElementById('pbq').innerHTML =
-  D.pullback.length ? D.pullback.join('<br>') : '<span class="empty">none at the EMA</span>';
+  D.pullback.length ? D.pullback.map(qline).join('<br>') : '<span class="empty">none at the EMA</span>';
 document.getElementById('boq').innerHTML =
-  D.breakout.length ? D.breakout.join('<br>') : '<span class="empty">none near pivot</span>';
+  D.breakout.length ? D.breakout.map(qline).join('<br>') : '<span class="empty">none near pivot</span>';
+
+document.getElementById('c-mc').textContent = D.count_mc;
+document.getElementById('c-n5').textContent = D.count_n5;
 
 function plan(r) {{
   if (r.cap_constraint) return '⚠ 1 share exceeds outlay band';
@@ -316,23 +365,38 @@ function row(r) {{
   </tr>`;
 }}
 
-let rows = D.results.slice();
-function draw() {{
-  document.querySelector('#tbl tbody').innerHTML = rows.map(row).join('');
-}}
+let universe = 'mc';
 let sortK = 'score', sortAsc = false;
-document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {{
-  const k = th.dataset.k;
-  sortAsc = (k === sortK) ? !sortAsc : false;
-  sortK = k;
+let rows = [];
+
+function loadUniverse() {{
+  rows = (universe === 'mc' ? D.results_mc : D.results_n5).slice();
+  applySort();
+}}
+function applySort() {{
   rows.sort((a,b) => {{
-    const x=a[k], y=b[k];
+    const x=a[sortK], y=b[sortK];
     if (x==null) return 1; if (y==null) return -1;
     return (typeof x==='string' ? x.localeCompare(y) : x-y) * (sortAsc?1:-1);
   }});
   draw();
+}}
+function draw() {{
+  document.querySelector('#tbl tbody').innerHTML = rows.map(row).join('');
+}}
+function setUniverse(u) {{
+  universe = u;
+  document.getElementById('tg-mc').classList.toggle('on', u==='mc');
+  document.getElementById('tg-n5').classList.toggle('on', u==='n5');
+  loadUniverse();
+}}
+document.querySelectorAll('th[data-k]').forEach(th => th.onclick = () => {{
+  const k = th.dataset.k;
+  sortAsc = (k === sortK) ? !sortAsc : false;
+  sortK = k;
+  applySort();
 }});
-draw();
+loadUniverse();
 
 if (D.errors.length)
   document.getElementById('errs').textContent =
@@ -363,7 +427,9 @@ def main():
     else:
         idx_df = fetch_yahoo(INDEX_SYMBOL)
 
+        import time as _t
         def get_data(row):
+            _t.sleep(0.15)  # gentle throttle to avoid Yahoo rate-limiting at ~740 names
             return fetch_yahoo(row["yahoo"])
 
     timer = score_timer(idx_df)
